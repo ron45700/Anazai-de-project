@@ -1,17 +1,19 @@
 import json
 import time
 import os  # <--- הוספנו את זה (חובה בשביל עבודה עם נתיבים)
+import sys
 from datetime import datetime
 from kafka import KafkaConsumer
 
 # --- CONFIGURATION & PATH SETUP ---
 
+BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.append(BASE_DIR)
+
+from services.ai_enrichment import analyze_article_with_ai
+
 TOPIC_NAME = 'news_raw_data'
 KAFKA_SERVER = 'localhost:9092'
-
-# 1. חישוב הנתיב לתיקייה הראשית (anizai-pipeline)
-# אנחנו עולים שתי רמות למעלה: מקובץ זה -> לתיקיית processing -> לתיקייה הראשית
-BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 # 2. הגדרת הנתיב המלא לקובץ הפלט: anizai-pipeline/data/processed/processed_news.json
 OUTPUT_FILE = os.path.join(BASE_DIR, 'data', 'processed', 'processed_news.json')
@@ -24,7 +26,7 @@ os.makedirs(os.path.dirname(OUTPUT_FILE), exist_ok=True)
 def clean_text(text):
     """Simple text cleaning function"""
     if not text:
-        return None
+        return ""
     return " ".join(text.split())
 
 def process_message(message_value):
@@ -34,15 +36,47 @@ def process_message(message_value):
     if not message_value.get('title') or not message_value.get('url'):
         return None
 
+    # --- חילוץ חכם של שם המקור (התיקון לקריסה) ---
+    raw_source = message_value.get('source')
+    source_name = 'Unknown'
+    
+    if isinstance(raw_source, dict):
+        # אם זה מילון (כמו שציפינו), נחלץ את ה-name
+        source_name = raw_source.get('name', 'Unknown')
+    elif isinstance(raw_source, str):
+        # אם זה סתם סטרינג, נשתמש בו כמו שהוא
+        source_name = raw_source
+
+# --- שלב ה-AI: קריאה למוח ---
+    # אנחנו שולחים את הכותרת והתיאור לניתוח
+    print(f"🤖 Analyzing with AI: {message_value['title'][:30]}...") # לוג כדי שתראה שזה עובד
+    
+    ai_result = analyze_article_with_ai(
+        title=message_value.get('title'),
+        description=message_value.get('description'),
+        source_name=source_name # שימוש במשתנה שחילצנו בבטחה
+    )
+    
+    # אם ה-AI נכשל, נשתמש בערכי ברירת מחדל ריקים
+    if not ai_result:
+        ai_result = {
+            "sentiment": "Neutral",
+            "confidence_level": 0.0,
+            "summary": message_value.get('description'), # אם אין AI, התיאור הוא הסיכום
+            "entities": [],
+            "reliability_score": 0.5
+        }
+
+
     # 2. בניית האובייקט לפי הסכמה של הפרויקט
     processed_article = {
         "article_id": str(abs(hash(message_value['url']))),
         
         "source": {
             "collector": "newsapi_scraper",
-            "publisher": clean_text(message_value['source']),
+            "publisher": clean_text(source_name),
             "source_type": "news",
-            "reliability_score": None
+            "reliability_score": ai_result.get('reliability_score')
         },
         
         "author": {
@@ -57,19 +91,20 @@ def process_message(message_value):
         "description": clean_text(message_value.get('description')),
         
         "timestamps": {
-            "published_at": message_value['publishedAt'],
+            "published_at": message_value.get('publishedAt'),
             "collected_at": datetime.now().isoformat()
         },
         
         "metadata": {
-            "sentiment": None,
-            "entities": [],
-            "confidence_level": None
+            "sentiment": ai_result.get('sentiment'),
+            "entities": ai_result.get('entities'),
+            "confidence_level": ai_result.get('confidence_level')
         },
         
         "processing": {
+            "summary": ai_result.get('summary'),
             "embedded": False,
-            "summary_done": False
+            "summary_done": True
         }
     }
     
@@ -90,7 +125,7 @@ def run_silver_consumer():
         bootstrap_servers=KAFKA_SERVER,
         auto_offset_reset='earliest',
         enable_auto_commit=True,
-        group_id='silver-layer-group',
+        group_id='silver-layer-ai-group-v1',
         value_deserializer=lambda x: json.loads(x.decode('utf-8'))
     )
 
@@ -103,8 +138,7 @@ def run_silver_consumer():
             if clean_data:
                 save_to_json_file(clean_data)
                 count += 1
-                if count % 5 == 0:
-                    print(f"Processed {count} articles. Last: {clean_data['title'][:30]}...")
+                print(f"✅ Saved article {count}: {clean_data['title'][:30]}... (Sentiment: {clean_data['metadata']['sentiment']})")
             
     except KeyboardInterrupt:
         print("\nStopping consumer...")
